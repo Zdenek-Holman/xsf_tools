@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.streamlit/secrets.toml
+
+# Generated and bulky scientific outputs are intentionally not part of the app.
+*.xsf
+*.npz
+*.csv
+*.vasp
+*.cif
+*.poscar
+*.txt
+!requirements.txt
+
+# Local OS/editor noise.
+.DS_Store
+.idea/
+.vscode/
