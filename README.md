@@ -14,12 +14,6 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Deploy On Streamlit Community Cloud
+## Use online on Streamlit Community Cloud
 
-Create a new app from this GitHub repository and use:
-
-- branch: `main`
-- main file: `streamlit_app.py`
-
-The app processes uploaded files in memory and returns downloadable `.xsf`
-outputs. Large generated calculation files are not tracked in Git.
+https://xsftools.streamlit.app/
