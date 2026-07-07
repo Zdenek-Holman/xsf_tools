@@ -4,7 +4,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from xsf_tools import cut_xsf_text, subtract_xsf_text
+from xsf_slice_to_tiff import slice_xsf_text_to_tiff_bytes
+from xsf_tools import cut_xsf_box_text, cut_xsf_text, subtract_xsf_text
 
 
 def _decode_upload(uploaded_file) -> str:
@@ -26,41 +27,75 @@ def _format_grid(shape: tuple[int, int, int]) -> str:
 st.set_page_config(page_title="XSF Tools", layout="wide")
 st.title("XSF Tools")
 
-cut_tab, subtract_tab = st.tabs(["Cut XSF", "Subtract XSF"])
+cut_tab, subtract_tab, slice_tab = st.tabs(["Cut XSF", "Subtract XSF", "Slice TIFF"])
 
 with cut_tab:
     cut_file = st.file_uploader("XSF file", type=["xsf"], key="cut_file")
 
+    cut_shape = st.radio(
+        "Cut shape",
+        ["bounds", "box"],
+        horizontal=True,
+        key="cut_shape",
+    )
     mode = st.radio(
-        "Coordinates",
+        "Coordinates / point units",
         ["cartesian", "fractional"],
         horizontal=True,
         key="cut_coordinate_mode",
     )
 
-    if mode == "fractional":
-        default_bounds = ((0.0, 1.0), (0.0, 1.0), (0.0, 1.0))
-    else:
-        default_bounds = ((-100.0, 100.0), (-100.0, 100.0), (5.0, 6.0))
+    bounds = None
+    points = None
+    if cut_shape == "bounds":
+        if mode == "fractional":
+            default_bounds = ((0.0, 1.0), (0.0, 1.0), (0.0, 1.0))
+        else:
+            default_bounds = ((-100.0, 100.0), (-100.0, 100.0), (5.0, 6.0))
 
-    bound_columns = st.columns(3)
-    axes = ("x", "y", "z")
-    bounds = []
-    for column, axis, default in zip(bound_columns, axes, default_bounds):
-        with column:
-            lower = st.number_input(
-                f"{axis} min",
-                value=default[0],
-                format="%.7f",
-                key=f"cut_{mode}_{axis}_min",
-            )
-            upper = st.number_input(
-                f"{axis} max",
-                value=default[1],
-                format="%.7f",
-                key=f"cut_{mode}_{axis}_max",
-            )
-            bounds.append((lower, upper))
+        bound_columns = st.columns(3)
+        bounds = []
+        for column, axis, default in zip(bound_columns, ("x", "y", "z"), default_bounds):
+            with column:
+                lower = st.number_input(
+                    f"{axis} min",
+                    value=default[0],
+                    format="%.7f",
+                    key=f"cut_bounds_{mode}_{axis}_min",
+                )
+                upper = st.number_input(
+                    f"{axis} max",
+                    value=default[1],
+                    format="%.7f",
+                    key=f"cut_bounds_{mode}_{axis}_max",
+                )
+                bounds.append((lower, upper))
+    else:
+        st.caption(
+            "Box definition: u = B − A, v = C − B, w = D − A. "
+            "Points inside A + s*u + t*v + r*w with 0 ≤ s,t,r ≤ 1 are kept."
+        )
+        default_points = {
+            "A": (0.0, 0.0, 0.0),
+            "B": (1.0, 0.0, 0.0),
+            "C": (1.0, 1.0, 0.0),
+            "D": (0.0, 0.0, 1.0),
+        }
+        points = {}
+        for point_name, defaults in default_points.items():
+            columns = st.columns(3)
+            point_values = []
+            for column, axis, default in zip(columns, ("x", "y", "z"), defaults):
+                with column:
+                    point_values.append(
+                        st.number_input(
+                            f"{point_name}{axis}",
+                            value=default,
+                            format="%.7f",
+                            key=f"cut_box_{mode}_{point_name}_{axis}",
+                        )
+                    )
+            points[point_name] = tuple(point_values)
 
     value_columns = st.columns(2)
     with value_columns[0]:
@@ -85,14 +120,27 @@ with cut_tab:
             st.warning("Upload an XSF file first.")
         else:
             try:
-                result_text, stats = cut_xsf_text(
-                    _decode_upload(cut_file),
-                    bounds,
-                    coordinate_mode=mode,
-                    outside_value=outside_value,
-                    test_value=fill_value if use_fill_value else None,
-                    source_name=cut_file.name,
-                )
+                if cut_shape == "bounds":
+                    result_text, stats = cut_xsf_text(
+                        _decode_upload(cut_file),
+                        bounds,
+                        coordinate_mode=mode,
+                        outside_value=outside_value,
+                        test_value=fill_value if use_fill_value else None,
+                        source_name=cut_file.name,
+                    )
+                else:
+                    result_text, stats = cut_xsf_box_text(
+                        _decode_upload(cut_file),
+                        points["A"],
+                        points["B"],
+                        points["C"],
+                        points["D"],
+                        point_mode=mode,
+                        outside_value=outside_value,
+                        test_value=fill_value if use_fill_value else None,
+                        source_name=cut_file.name,
+                    )
             except ValueError as error:
                 st.error(str(error))
             else:
@@ -188,4 +236,99 @@ with subtract_tab:
             file_name=st.session_state.subtract_result_filename,
             mime="text/plain",
             key="download_subtract",
+        )
+
+with slice_tab:
+    slice_file = st.file_uploader("XSF file", type=["xsf"], key="slice_file")
+
+    slice_columns = st.columns(4)
+    with slice_columns[0]:
+        slice_axis = st.selectbox("Axis", ["x", "y", "z"], index=2, key="slice_axis")
+    with slice_columns[1]:
+        use_custom_index = st.checkbox("Custom index", key="slice_custom_index")
+    with slice_columns[2]:
+        slice_index = st.number_input(
+            "Index",
+            min_value=0,
+            value=0,
+            step=1,
+            disabled=not use_custom_index,
+            key="slice_index",
+        )
+    with slice_columns[3]:
+        slice_geometry = st.selectbox(
+            "Geometry",
+            ["grid", "real"],
+            key="slice_geometry",
+        )
+
+    option_columns = st.columns(4)
+    with option_columns[0]:
+        invert_slice = st.checkbox("Invert", key="slice_invert")
+    with option_columns[1]:
+        slice_background = st.selectbox(
+            "Background",
+            ["black", "white"],
+            disabled=slice_geometry != "real",
+            key="slice_background",
+        )
+    with option_columns[2]:
+        use_custom_resolution = st.checkbox(
+            "Custom px/Å",
+            disabled=slice_geometry != "real",
+            key="slice_custom_resolution",
+        )
+    with option_columns[3]:
+        pixels_per_angstrom = st.number_input(
+            "Pixels per Å",
+            min_value=0.000001,
+            value=8.0,
+            format="%.6f",
+            disabled=slice_geometry != "real" or not use_custom_resolution,
+            key="slice_pixels_per_angstrom",
+        )
+
+    if st.button("Generate TIFF slice", type="primary", key="generate_slice"):
+        if slice_file is None:
+            st.warning("Upload an XSF file first.")
+        else:
+            try:
+                tiff_bytes, stats = slice_xsf_text_to_tiff_bytes(
+                    _decode_upload(slice_file),
+                    source_name=slice_file.name,
+                    axis=slice_axis,
+                    index=int(slice_index) if use_custom_index else None,
+                    invert=invert_slice,
+                    geometry=slice_geometry,
+                    pixels_per_angstrom=(
+                        pixels_per_angstrom
+                        if slice_geometry == "real" and use_custom_resolution
+                        else None
+                    ),
+                    background=slice_background,
+                )
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                suffix = f"{stats.axis}{stats.index:03d}"
+                if stats.geometry == "real":
+                    suffix += "_real"
+                st.session_state.slice_tiff_bytes = tiff_bytes
+                st.session_state.slice_result_filename = f"{_stem(slice_file.name, 'energy_grid')}_{suffix}.tiff"
+                st.session_state.slice_stats = stats
+
+    if "slice_tiff_bytes" in st.session_state:
+        stats = st.session_state.slice_stats
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Axis", stats.axis)
+        metric_columns[1].metric("Index", stats.index)
+        metric_columns[2].metric("Geometry", stats.geometry)
+        metric_columns[3].metric("Image", f"{stats.image_shape[0]} x {stats.image_shape[1]}")
+        st.metric("Energy range", f"{stats.energy_min:.7f} to {stats.energy_max:.7f} eV")
+        st.download_button(
+            "Download TIFF slice",
+            data=st.session_state.slice_tiff_bytes,
+            file_name=st.session_state.slice_result_filename,
+            mime="image/tiff",
+            key="download_slice",
         )

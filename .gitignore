@@ -8,6 +8,8 @@ env/
 
 # Generated and bulky scientific outputs are intentionally not part of the app.
 *.xsf
+*.tif
+*.tiff
 *.npz
 *.csv
 *.vasp
@@ -15,8 +17,11 @@ env/
 *.poscar
 *.txt
 !requirements.txt
+!examples/
+!examples/*.xsf
 
 # Local OS/editor noise.
 .DS_Store
 .idea/
 .vscode/
+gitignore

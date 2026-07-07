@@ -2,8 +2,9 @@
 
 Streamlit app and command-line helpers for simple XSF 3-D data-grid workflows:
 
-- cut one XSF grid to a Cartesian or fractional coordinate region
+- cut one XSF grid to Cartesian/fractional bounds or a 4-point oblique box
 - subtract values from two uploaded XSF maps, with optional minima alignment
+- export 16-bit TIFF slices from XSF energy maps in grid or real-space geometry
 
 ## Run Locally
 
@@ -17,3 +18,13 @@ streamlit run streamlit_app.py
 ## Use online on Streamlit Community Cloud
 
 https://xsftools.streamlit.app/
+
+## Deploy On Streamlit Community Cloud
+
+Create a new app from this GitHub repository and use:
+
+- branch: `main`
+- main file: `streamlit_app.py`
+
+The app processes uploaded files in memory and returns downloadable `.xsf` and `.tiff`
+outputs. Large generated calculation files are not tracked in Git.

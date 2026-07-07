@@ -11,6 +11,7 @@ import numpy as np
 
 
 Bounds = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+Point3D = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,49 @@ def _normalise_bounds(bounds: Sequence[Sequence[float]]) -> Bounds:
         normalised.append((lower, upper))
 
     return normalised[0], normalised[1], normalised[2]
+
+
+def _normalise_point(point: Sequence[float], name: str) -> np.ndarray:
+    if len(point) != 3:
+        raise ValueError(f"{name} must contain exactly three coordinates")
+    try:
+        result = np.asarray(point, dtype=float)
+    except ValueError as error:
+        raise ValueError(f"{name} contains a nonnumeric coordinate") from error
+    if result.shape != (3,):
+        raise ValueError(f"{name} must be a 3-D point")
+    return result
+
+
+def _grid_coordinate_arrays(
+    shape: tuple[int, int, int],
+    origin: np.ndarray,
+    vectors: np.ndarray,
+    coordinate_mode: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return grid-point coordinates in fractional or Cartesian space."""
+    nx, ny, nz = shape
+
+    # XSF grid vectors connect the first and last grid points, so N points
+    # contain N-1 intervals and include fractional coordinates 0 and 1.
+    u = np.linspace(0.0, 1.0, nx)[:, None, None]
+    v = np.linspace(0.0, 1.0, ny)[None, :, None]
+    w = np.linspace(0.0, 1.0, nz)[None, None, :]
+
+    mode = coordinate_mode.lower()
+    if mode == "fractional":
+        coordinates = (u, v, w)
+    elif mode == "cartesian":
+        x = origin[0] + u * vectors[0, 0] + v * vectors[1, 0] + w * vectors[2, 0]
+        y = origin[1] + u * vectors[0, 1] + v * vectors[1, 1] + w * vectors[2, 1]
+        z = origin[2] + u * vectors[0, 2] + v * vectors[1, 2] + w * vectors[2, 2]
+        coordinates = (x, y, z)
+    else:
+        raise ValueError(
+            f"unknown coordinate_mode {coordinate_mode!r}; use 'cartesian' or 'fractional'"
+        )
+
+    return tuple(np.broadcast_to(coordinate, shape) for coordinate in coordinates)  # type: ignore[return-value]
 
 
 def parse_cut_grid_text(input_text: str, source_name: str = "uploaded.xsf") -> XSFCutGrid:
@@ -168,33 +212,70 @@ def make_region_mask(
     coordinate_mode: str,
 ) -> np.ndarray:
     """Return a mask in either Cartesian or DATAGRID fractional coordinates."""
-    nx, ny, nz = shape
     checked_bounds = _normalise_bounds(bounds)
-
-    # XSF grid vectors connect the first and last grid points, so N points
-    # contain N-1 intervals and include fractional coordinates 0 and 1.
-    u = np.linspace(0.0, 1.0, nx)[:, None, None]
-    v = np.linspace(0.0, 1.0, ny)[None, :, None]
-    w = np.linspace(0.0, 1.0, nz)[None, None, :]
-
-    mode = coordinate_mode.lower()
-    if mode == "fractional":
-        coordinates = (u, v, w)
-    elif mode == "cartesian":
-        x = origin[0] + u * vectors[0, 0] + v * vectors[1, 0] + w * vectors[2, 0]
-        y = origin[1] + u * vectors[0, 1] + v * vectors[1, 1] + w * vectors[2, 1]
-        z = origin[2] + u * vectors[0, 2] + v * vectors[1, 2] + w * vectors[2, 2]
-        coordinates = (x, y, z)
-    else:
-        raise ValueError(
-            f"unknown coordinate_mode {coordinate_mode!r}; use 'cartesian' or 'fractional'"
-        )
+    coordinates = _grid_coordinate_arrays(shape, origin, vectors, coordinate_mode)
 
     inside = np.ones(shape, dtype=bool)
     for coordinate, (lower, upper) in zip(coordinates, checked_bounds):
         inside &= (coordinate >= lower) & (coordinate <= upper)
 
     return inside
+
+
+def make_box_mask(
+    shape: tuple[int, int, int],
+    origin: np.ndarray,
+    vectors: np.ndarray,
+    point_a: Sequence[float],
+    point_b: Sequence[float],
+    point_c: Sequence[float],
+    point_d: Sequence[float],
+    point_mode: str,
+    tolerance: float = 1e-9,
+) -> np.ndarray:
+    """Return a mask inside the 4-point oblique box/parallelepiped.
+
+    The box is defined as:
+
+        P = A + s * (B - A) + t * (C - B) + r * (D - A)
+
+    and points with 0 <= s,t,r <= 1 are kept.
+    """
+    mode = point_mode.lower()
+    if mode not in {"cartesian", "fractional"}:
+        raise ValueError(f"unknown point_mode {point_mode!r}; use 'cartesian' or 'fractional'")
+
+    a = _normalise_point(point_a, "POINT_A")
+    b = _normalise_point(point_b, "POINT_B")
+    c = _normalise_point(point_c, "POINT_C")
+    d = _normalise_point(point_d, "POINT_D")
+
+    u = b - a
+    v = c - b
+    w = d - a
+    basis = np.column_stack([u, v, w])
+
+    try:
+        inverse_basis = np.linalg.inv(basis)
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            "invalid box points: B-A, C-B, and D-A are linearly dependent"
+        ) from error
+
+    condition_number = np.linalg.cond(basis)
+    if not np.isfinite(condition_number) or condition_number > 1e12:
+        raise ValueError(
+            "invalid box points: B-A, C-B, and D-A are linearly dependent or nearly so"
+        )
+
+    coordinates = _grid_coordinate_arrays(shape, origin, vectors, mode)
+    points = np.stack([coordinate.ravel() for coordinate in coordinates], axis=0)
+    coefficients = inverse_basis @ (points - a[:, None])
+
+    lower = -float(tolerance)
+    upper = 1.0 + float(tolerance)
+    inside_flat = np.all((coefficients >= lower) & (coefficients <= upper), axis=0)
+    return inside_flat.reshape(shape)
 
 
 def write_cut_grid_text(grid: XSFCutGrid, masked_data: np.ndarray) -> str:
@@ -240,6 +321,49 @@ def cut_xsf_text(
         selected_points=int(np.count_nonzero(inside)),
         total_points=int(np.prod(grid.shape)),
         coordinate_mode=coordinate_mode.lower(),
+        output_min=float(np.min(masked)),
+        output_max=float(np.max(masked)),
+    )
+    return result_text, stats
+
+
+def cut_xsf_box_text(
+    input_text: str,
+    point_a: Sequence[float],
+    point_b: Sequence[float],
+    point_c: Sequence[float],
+    point_d: Sequence[float],
+    point_mode: str = "cartesian",
+    outside_value: float = 0.0,
+    test_value: float | None = None,
+    source_name: str = "uploaded.xsf",
+) -> tuple[str, CutStats]:
+    """Cut an XSF data grid to a 4-point oblique box and return text plus stats."""
+    grid = parse_cut_grid_text(input_text, source_name=source_name)
+    inside = make_box_mask(
+        grid.shape,
+        grid.origin,
+        grid.vectors,
+        point_a,
+        point_b,
+        point_c,
+        point_d,
+        point_mode,
+    )
+
+    masked = np.full(grid.shape, float(outside_value), dtype=float)
+    if test_value is None:
+        masked[inside] = grid.data[inside]
+    else:
+        masked[inside] = float(test_value)
+
+    result_text = write_cut_grid_text(grid, masked)
+    mode = point_mode.lower()
+    stats = CutStats(
+        shape=grid.shape,
+        selected_points=int(np.count_nonzero(inside)),
+        total_points=int(np.prod(grid.shape)),
+        coordinate_mode=f"{mode} box",
         output_min=float(np.min(masked)),
         output_max=float(np.max(masked)),
     )
