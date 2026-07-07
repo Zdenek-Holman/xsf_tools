@@ -27,9 +27,13 @@ def _format_grid(shape: tuple[int, int, int]) -> str:
 st.set_page_config(page_title="XSF Tools", layout="wide")
 st.title("XSF Tools")
 
-cut_tab, subtract_tab, slice_tab = st.tabs(["Cut XSF", "Subtract XSF", "Slice TIFF"])
+tool = st.radio(
+    "Tool",
+    ["Cut XSF", "Subtract XSF", "Slice TIFF"],
+    horizontal=True,
+)
 
-with cut_tab:
+if tool == "Cut XSF":
     cut_file = st.file_uploader("XSF file", type=["xsf"], key="cut_file")
 
     cut_shape = st.radio(
@@ -166,7 +170,7 @@ with cut_tab:
             key="download_cut",
         )
 
-with subtract_tab:
+elif tool == "Subtract XSF":
     upload_columns = st.columns(2)
     with upload_columns[0]:
         map_a = st.file_uploader("Map A", type=["xsf"], key="subtract_map_a")
@@ -238,7 +242,7 @@ with subtract_tab:
             key="download_subtract",
         )
 
-with slice_tab:
+elif tool == "Slice TIFF":
     st.write(
         "Upload an XSF energy map, choose one slice, and export it as a 16-bit "
         "grayscale TIFF."
