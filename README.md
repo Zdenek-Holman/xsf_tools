@@ -25,13 +25,3 @@ streamlit run streamlit_app.py
 ## Use online on Streamlit Community Cloud
 
 https://xsftools.streamlit.app/
-
-## Deploy On Streamlit Community Cloud
-
-Create a new app from this GitHub repository and use:
-
-- branch: `main`
-- main file: `streamlit_app.py`
-
-The app processes uploaded files in memory and returns downloadable `.xsf` and `.tiff`
-outputs. Large generated calculation files are not tracked in Git.
