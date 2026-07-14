@@ -6,7 +6,6 @@ import streamlit as st
 
 from xsf_slice_to_tiff import (
     export_xsf_slices_to_bytes,
-    parse_slice_indices,
     select_slice_indices,
 )
 from xsf_tools import (
@@ -307,36 +306,9 @@ elif tool == "Slice TIFF":
             key="slice_scaling",
         )
 
-    selection_mode = st.radio(
-        "Slice selection",
-        ["Exact indices", "Equidistant"],
-        horizontal=True,
-        key="slice_selection_mode",
-    )
-    if selection_mode == "Exact indices":
-        slice_indices_text = st.text_input(
-            "Slice indices",
-            value="0",
-            help="Enter comma-separated grid indices, for example: 0, 12, 45",
-            key="slice_indices_text",
-        )
-        slice_count = None
-    else:
-        slice_indices_text = None
-        slice_count = st.number_input(
-            "Number of slices",
-            min_value=1,
-            value=1,
-            step=1,
-            help="Slices include both ends of the selected axis. One slice uses the middle.",
-            key="slice_count",
-        )
-
-    invert_slice = st.checkbox("Invert brightness", key="slice_invert")
-
     slice_text = None
-    selected_preview = None
-    upload_error = None
+    axis_size = None
+    file_error = None
     if slice_file is not None:
         try:
             slice_text = _decode_upload(slice_file)
@@ -345,32 +317,104 @@ elif tool == "Slice TIFF":
                 source_name=slice_file.name,
             )
             axis_size = uploaded_grid.shape[{"x": 0, "y": 1, "z": 2}[slice_axis]]
-            exact_indices = (
-                parse_slice_indices(slice_indices_text)
-                if selection_mode == "Exact indices"
-                else None
-            )
-            selected_preview = select_slice_indices(
-                axis_size,
-                indices=exact_indices,
-                count=int(slice_count) if selection_mode == "Equidistant" else None,
-            )
         except ValueError as error:
-            upload_error = str(error)
+            file_error = str(error)
 
-    if selected_preview is not None:
+    selection_mode = st.radio(
+        "Slice selection",
+        ["Exact indices", "Equidistant"],
+        horizontal=True,
+        key="slice_selection_mode",
+    )
+
+    selected_preview = None
+    selection_error = None
+    slice_count = None
+    if selection_mode == "Exact indices":
+        if axis_size is None:
+            if slice_file is None:
+                st.info("Upload a valid XSF file to choose exact slice indices.")
+        else:
+            exact_count = st.number_input(
+                "Number of exact slices",
+                min_value=1,
+                max_value=axis_size,
+                value=1,
+                step=1,
+                key=f"slice_exact_count_{slice_axis}_{axis_size}",
+            )
+            exact_count = int(exact_count)
+            default_indices = select_slice_indices(axis_size, count=exact_count)
+            exact_indices = []
+            for row_start in range(0, exact_count, 4):
+                row_end = min(row_start + 4, exact_count)
+                index_columns = st.columns(row_end - row_start)
+                for column, position in zip(
+                    index_columns,
+                    range(row_start, row_end),
+                ):
+                    with column:
+                        exact_indices.append(
+                            int(
+                                st.number_input(
+                                    f"Exact index {position + 1}",
+                                    min_value=0,
+                                    max_value=axis_size - 1,
+                                    value=default_indices[position],
+                                    step=1,
+                                    key=(
+                                        f"slice_exact_index_{slice_axis}_{axis_size}_"
+                                        f"{exact_count}_{position}"
+                                    ),
+                                )
+                            )
+                        )
+            try:
+                selected_preview = select_slice_indices(
+                    axis_size,
+                    indices=exact_indices,
+                )
+            except ValueError as error:
+                selection_error = str(error)
+    else:
+        slice_count = st.number_input(
+            "Number of slices",
+            min_value=1,
+            value=1,
+            step=1,
+            help="Slices include both ends of the selected axis. One slice uses the middle.",
+            key="slice_count",
+        )
+        if axis_size is not None:
+            try:
+                selected_preview = select_slice_indices(
+                    axis_size,
+                    count=int(slice_count),
+                )
+            except ValueError as error:
+                selection_error = str(error)
+
+    invert_slice = st.checkbox("Invert brightness", key="slice_invert")
+
+    if file_error is not None:
+        st.warning(file_error)
+    elif selected_preview is not None:
         st.caption(
             f"Selected {len(selected_preview)} slice(s) from axis positions "
             f"0–{axis_size - 1}: {', '.join(str(value) for value in selected_preview)}"
         )
-    elif upload_error is not None:
-        st.warning(upload_error)
+    elif selection_error is not None:
+        st.warning(selection_error)
 
     if st.button("Generate TIFF", type="primary", key="generate_slice"):
         if slice_file is None:
             st.warning("Upload an XSF file first.")
-        elif upload_error is not None:
-            st.error(upload_error)
+        elif file_error is not None:
+            st.error(file_error)
+        elif selection_error is not None:
+            st.error(selection_error)
+        elif selected_preview is None:
+            st.error("Choose at least one valid slice index.")
         else:
             try:
                 output_bytes, stats = export_xsf_slices_to_bytes(
