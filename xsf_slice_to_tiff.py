@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from itertools import product
 from pathlib import Path
@@ -20,7 +20,7 @@ from xsf_tools import parse_cut_grid_text, resolve_atomic_identifier
 
 AXIS_TO_NUMBER = {"x": 0, "y": 1, "z": 2}
 PLANE_AXES = {"x": (1, 2), "y": (0, 2), "z": (0, 1)}
-BIT_DEPTHS = {16, 32}
+BIT_DEPTHS = {32}
 SCALING_MODES = {"shared", "per-slice"}
 
 
@@ -85,11 +85,11 @@ class SliceExportResult:
 
 def print_options(file=sys.stderr) -> None:
     print(
-        "Create 16-bit integer or 32-bit float grayscale TIFF slices from an XSF map.\n"
+        "Create 32-bit float grayscale TIFF slices from an XSF map.\n"
         "\n"
         "Examples:\n"
         "python3 xsf_slice_to_tiff.py map.xsf --index 45\n"
-        "python3 xsf_slice_to_tiff.py map.xsf --indices 0,20,45,89 --bit-depth 16\n"
+        "python3 xsf_slice_to_tiff.py map.xsf --indices 0,20,45,89\n"
         "python3 xsf_slice_to_tiff.py map.xsf --count 10 --geometry real\n"
         "python3 xsf_slice_to_tiff.py map.xsf --count 5 --scaling per-slice -o cuts.zip\n"
         "python3 xsf_slice_to_tiff.py map.xsf --index 45 --include-atoms "
@@ -132,13 +132,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of equidistant slices spanning the complete selected axis",
     )
     parser.add_argument(
-        "--bit-depth",
-        type=int,
-        choices=(16, 32),
-        default=32,
-        help="TIFF pixel depth: uint16 or normalized float32 (default: 32)",
-    )
-    parser.add_argument(
         "--scaling",
         choices=("shared", "per-slice"),
         default="shared",
@@ -169,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-atoms",
         action="store_true",
-        help="include raw-valued atomic sphere TIFFs in a ZIP",
+        help="overlay raw-valued atomic spheres in each energy TIFF",
     )
     parser.add_argument(
         "--atom-radius",
@@ -283,11 +276,6 @@ def slice_filename(stem: str, axis: str, index: int, geometry: str) -> str:
     return f"{stem}_{suffix}.tiff"
 
 
-def atom_slice_filename(stem: str, axis: str, index: int, geometry: str) -> str:
-    energy_name = slice_filename(stem, axis, index, geometry)
-    return energy_name.removesuffix(".tiff") + "_atoms.tiff"
-
-
 def default_output_path(
     input_xsf: Path,
     axis: str,
@@ -340,11 +328,11 @@ def scale_with_limits(
     energy_min: float,
     energy_max: float,
     invert: bool,
-    bit_depth: int = 16,
+    bit_depth: int = 32,
 ) -> np.ndarray:
-    """Scale energies to uint16 or normalized float32 image samples."""
-    if bit_depth not in BIT_DEPTHS:
-        raise ValueError("bit depth must be 16 or 32")
+    """Scale energies to float32 image samples from 0 to 100."""
+    if bit_depth != 32:
+        raise ValueError("only 32-bit float TIFF output is supported")
 
     if energy_max > energy_min:
         scaled = (values - energy_min) / (energy_max - energy_min)
@@ -353,21 +341,7 @@ def scale_with_limits(
 
     if invert:
         scaled = 1.0 - scaled
-    scaled = np.clip(scaled, 0.0, 1.0)
-
-    if bit_depth == 16:
-        return np.rint(scaled * 65535.0).astype(np.uint16)
-    return scaled.astype(np.float32)
-
-
-def scale_to_uint16(slice_2d: np.ndarray, invert: bool) -> tuple[np.ndarray, float, float]:
-    """Backward-compatible helper for scaling one slice to uint16."""
-    energy_min, energy_max = finite_limits(slice_2d)
-    return (
-        scale_with_limits(slice_2d, energy_min, energy_max, invert, bit_depth=16),
-        energy_min,
-        energy_max,
-    )
+    return (np.clip(scaled, 0.0, 1.0) * 100.0).astype(np.float32)
 
 
 def project_plane_vectors(
@@ -507,22 +481,18 @@ def render_real_space_slice(
     pixels_per_angstrom: float | None,
     invert: bool,
     background: str,
-    bit_depth: int = 16,
+    bit_depth: int = 32,
     energy_limits: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, float, float, float]:
-    """Render a real-space plane; defaults retain the former uint16 behavior."""
+    """Render a real-space plane as float32 intensity from 0 to 100."""
     energy_min, energy_max = finite_limits(plane)
     scale_min, scale_max = energy_limits or (energy_min, energy_max)
     sampled, inside, final_resolution = real_space_samples(
         plane, vector_u, vector_v, pixels_per_angstrom
     )
     scaled = scale_with_limits(sampled, scale_min, scale_max, invert, bit_depth)
-    if bit_depth == 16:
-        background_value: int | float = 0 if background == "black" else 65535
-        image_data = np.full(scaled.shape, background_value, dtype=np.uint16)
-    else:
-        background_value = 0.0 if background == "black" else 1.0
-        image_data = np.full(scaled.shape, background_value, dtype=np.float32)
+    background_value = 0.0 if background == "black" else 100.0
+    image_data = np.full(scaled.shape, background_value, dtype=np.float32)
     image_data[inside] = scaled[inside]
     return image_data, energy_min, energy_max, final_resolution
 
@@ -534,7 +504,7 @@ def normalise_atom_radii(
 ) -> dict[str, float]:
     """Validate per-element radii and fill missing detected elements."""
     if not atoms:
-        raise ValueError("atom maps were requested, but the XSF has no PRIMCOORD atoms")
+        raise ValueError("atom overlays were requested, but the XSF has no PRIMCOORD atoms")
     if not np.isfinite(default_radius) or default_radius <= 0.0:
         raise ValueError("default atom radius must be greater than zero")
 
@@ -631,10 +601,9 @@ def render_atom_sphere_map(
         pixels_per_angstrom,
     )
     cartesian = grid.origin + np.einsum("...i,ij->...j", fractional, grid.vectors)
-    if bit_depth == 16:
-        image_data = np.zeros(inside.shape, dtype=np.uint16)
-    else:
-        image_data = np.zeros(inside.shape, dtype=np.float32)
+    if bit_depth != 32:
+        raise ValueError("only 32-bit float TIFF output is supported")
+    image_data = np.zeros(inside.shape, dtype=np.float32)
 
     plane_axis_u, plane_axis_v = PLANE_AXES[axis]
     plane_normal = np.cross(
@@ -689,7 +658,7 @@ def render_atom_sphere_map(
             continue
 
         intersecting_atoms += 1
-        marker_value = 1000 + atom.atomic_number
+        marker_value = 110.0 + atom.atomic_number / 100.0
         image_data[atom_mask] = np.maximum(image_data[atom_mask], marker_value)
 
     return AtomMapResult(
@@ -717,7 +686,7 @@ def _validate_render_options(
     if background not in {"black", "white"}:
         raise ValueError(f"unknown background {background!r}; use 'black' or 'white'")
     if bit_depth not in BIT_DEPTHS:
-        raise ValueError("bit depth must be 16 or 32")
+        raise ValueError("only 32-bit float TIFF output is supported")
     if scaling not in SCALING_MODES:
         raise ValueError("scaling must be 'shared' or 'per-slice'")
 
@@ -907,34 +876,30 @@ def export_xsf_slices_to_bytes(
                 raise ValueError(
                     f"atom map dimensions do not match energy slice {image.index}"
                 )
+        overlaid_images = []
+        for image, atom_map in zip(images, atom_maps):
+            overlaid_data = image.image_data.copy()
+            atom_pixels = atom_map.image_data > 0.0
+            overlaid_data[atom_pixels] = atom_map.image_data[atom_pixels]
+            overlaid_images.append(replace(image, image_data=overlaid_data))
+        images = tuple(overlaid_images)
 
-    if len(images) == 1 and not include_atoms:
+    if len(images) == 1:
         filename = slice_filename(stem, axis, images[0].index, geometry)
         output_bytes = image_to_tiff_bytes(images[0].image_data)
         mime_type = "image/tiff"
     else:
-        if len(images) == 1:
-            archive_suffix = f"{axis}{images[0].index:03d}"
-            if geometry == "real":
-                archive_suffix += "_real"
-            archive_suffix += "_with_atoms"
-        else:
-            archive_suffix = f"{axis}_slices"
-            if geometry == "real":
-                archive_suffix += "_real"
+        archive_suffix = f"{axis}_slices"
+        if geometry == "real":
+            archive_suffix += "_real"
         filename = f"{stem}_{archive_suffix}.zip"
         buffer = BytesIO()
         with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
-            for position, image in enumerate(images):
+            for image in images:
                 archive.writestr(
                     slice_filename(stem, axis, image.index, geometry),
                     image_to_tiff_bytes(image.image_data),
                 )
-                if include_atoms:
-                    archive.writestr(
-                        atom_slice_filename(stem, axis, image.index, geometry),
-                        image_to_tiff_bytes(atom_maps[position].image_data),
-                    )
         output_bytes = buffer.getvalue()
         mime_type = "application/zip"
 
@@ -1095,7 +1060,7 @@ def main() -> int:
             geometry=args.geometry,
             pixels_per_angstrom=args.pixels_per_angstrom,
             background=args.background,
-            bit_depth=args.bit_depth,
+            bit_depth=32,
             scaling=args.scaling,
             force=args.force,
             include_atoms=args.include_atoms,
@@ -1111,7 +1076,7 @@ def main() -> int:
         print(f"Slices:     {len(export.indices)}")
         print(f"Indices:    {', '.join(str(value) for value in export.indices)}")
         print(f"Geometry:   {export.geometry}")
-        print(f"Bit depth:  {export.bit_depth}-bit")
+        print("Format:     32-bit float TIFF")
         print(f"Scaling:    {export.scaling}")
         print(f"Image:      {image_description}")
         print(f"Energy:     {export.energy_min:.7f} to {export.energy_max:.7f} eV")
@@ -1123,7 +1088,7 @@ def main() -> int:
                 f"{atom_map.index}:{atom_map.intersecting_atoms}"
                 for atom_map in export.atom_maps
             )
-            print(f"Atom maps:  yes ({radii_text})")
+            print(f"Atoms:      overlaid ({radii_text})")
             print(f"Mapped:     {export.mapped_atoms} atom-slice intersections")
             print(f"Atom count: {atom_counts}")
         print(f"Written:    {output_path}")

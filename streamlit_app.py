@@ -252,8 +252,8 @@ elif tool == "Subtract XSF":
 
 elif tool == "Slice TIFF":
     st.write(
-        "Upload an XSF energy map and export one or more slices as 16-bit integer "
-        "or 32-bit float grayscale TIFF images."
+        "Upload an XSF energy map and export one or more slices as 32-bit float "
+        "grayscale TIFF images."
     )
 
     with st.expander("What do grid and real mean?", expanded=False):
@@ -269,19 +269,19 @@ elif tool == "Slice TIFF":
             **Invert** flips the brightness scale. Without inversion, low energy is
             dark and high energy is bright. With inversion, low energy is bright.
 
-            **32-bit** stores normalized floating-point brightness values from
-            `0.0` to `1.0`. **16-bit** stores integer brightness values from `0`
-            to `65535`. The TIFFs are visualizations; the displayed energy range
-            remains available separately in eV.
+            Energy is stored as 32-bit floating-point intensity from `0` to `100`.
+            The TIFFs are visualizations; the displayed energy range remains
+            available separately in eV.
 
-            **Atom-position TIFFs** contain periodic 3-D sphere cross-sections.
-            Their raw values are `1000 + atomic number`, with zero outside atoms.
+            **Atomic sphere overlays** replace energy pixels inside periodic 3-D
+            sphere cross-sections with `110 + atomic number / 100`. For example,
+            Mg is `110.12` and Ni is `110.28`.
             """
         )
 
     slice_file = st.file_uploader("XSF file", type=["xsf"], key="slice_file")
 
-    slice_columns = st.columns(4)
+    slice_columns = st.columns(3)
     with slice_columns[0]:
         slice_axis = st.selectbox("Slice axis", ["x", "y", "z"], index=2, key="slice_axis")
     with slice_columns[1]:
@@ -291,13 +291,6 @@ elif tool == "Slice TIFF":
             key="slice_geometry",
         )
     with slice_columns[2]:
-        slice_bit_depth = st.selectbox(
-            "Bit depth",
-            [32, 16],
-            format_func=lambda value: f"{value}-bit",
-            key="slice_bit_depth",
-        )
-    with slice_columns[3]:
         slice_scaling = st.selectbox(
             "Brightness scaling",
             ["shared", "per-slice"],
@@ -403,7 +396,7 @@ elif tool == "Slice TIFF":
         invert_slice = st.checkbox("Invert brightness", key="slice_invert")
     with option_columns[1]:
         include_atom_maps = st.checkbox(
-            "Include atom-position TIFFs",
+            "Overlay atomic spheres",
             key="slice_include_atom_maps",
         )
 
@@ -414,7 +407,7 @@ elif tool == "Slice TIFF":
             if slice_file is None:
                 st.info("Upload a valid XSF file to configure atom radii.")
         elif not uploaded_grid.atoms:
-            atom_error = "Atom maps were requested, but the XSF has no PRIMCOORD atoms."
+            atom_error = "Atom overlays were requested, but the XSF has no PRIMCOORD atoms."
         else:
             detected_elements = sorted(
                 {
@@ -481,7 +474,7 @@ elif tool == "Slice TIFF":
                     geometry=slice_geometry,
                     pixels_per_angstrom=None,
                     background="black",
-                    bit_depth=int(slice_bit_depth),
+                    bit_depth=32,
                     scaling=slice_scaling,
                     include_atoms=include_atom_maps,
                     atom_radii=atom_radii,
@@ -496,12 +489,11 @@ elif tool == "Slice TIFF":
 
     if "slice_output_bytes" in st.session_state:
         stats = st.session_state.slice_stats
-        metric_columns = st.columns(5)
+        metric_columns = st.columns(4)
         metric_columns[0].metric("Axis", stats.axis)
         metric_columns[1].metric("Slices", len(stats.indices))
         metric_columns[2].metric("Geometry", stats.geometry)
-        metric_columns[3].metric("Bit depth", f"{stats.bit_depth}-bit")
-        metric_columns[4].metric("Scaling", stats.scaling)
+        metric_columns[3].metric("Scaling", stats.scaling)
         shapes = set(stats.image_shapes)
         if len(shapes) == 1:
             image_shape = stats.image_shapes[0]

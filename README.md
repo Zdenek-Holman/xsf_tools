@@ -6,11 +6,12 @@ The Streamlit app includes TIFF slice export from XSF energy maps:
 
 - export one exact slice or multiple exact/equidistant slices
 - render in raw grid space or real-space lattice geometry
-- choose normalized 32-bit float TIFF (default) or 16-bit integer TIFF
+- store energy intensity in 32-bit float TIFF pixels from 0 to 100
 - use shared brightness scaling for comparison or scale every slice separately
 - download multiple slices together as a ZIP
 - optionally invert brightness
-- optionally add raw-valued atom-position TIFFs using periodic 3-D sphere cuts
+- optionally overlay periodic 3-D atomic spheres in the energy TIFF
+- encode atomic sphere pixels as 110 + atomic number / 100
 - set a separate sphere radius in Å for every detected element
 
 - cut one XSF grid to Cartesian/fractional bounds or a 4-point oblique box
