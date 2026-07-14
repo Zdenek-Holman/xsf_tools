@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Convert one 2-D slice of an XSF energy grid to a 16-bit TIFF image."""
+"""Export one or more 2-D slices of an XSF energy grid as TIFF images."""
 
 from __future__ import annotations
 
 import argparse
 import sys
-from io import BytesIO
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 from PIL import Image
@@ -17,6 +18,8 @@ from xsf_tools import parse_cut_grid_text
 
 AXIS_TO_NUMBER = {"x": 0, "y": 1, "z": 2}
 PLANE_AXES = {"x": (1, 2), "y": (0, 2), "z": (0, 1)}
+BIT_DEPTHS = {16, 32}
+SCALING_MODES = {"shared", "per-slice"}
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,8 @@ class SliceResult:
     axis: str
     index: int
     geometry: str
+    bit_depth: int
+    scaling: str
     image_shape: tuple[int, int]
     energy_min: float
     energy_max: float
@@ -35,21 +40,40 @@ class SliceImageResult:
     axis: str
     index: int
     geometry: str
+    bit_depth: int
+    scaling: str
     image_shape: tuple[int, int]
     energy_min: float
     energy_max: float
+    scale_min: float
+    scale_max: float
     image_data: np.ndarray
+
+
+@dataclass(frozen=True)
+class SliceExportResult:
+    axis: str
+    indices: tuple[int, ...]
+    geometry: str
+    bit_depth: int
+    scaling: str
+    image_shapes: tuple[tuple[int, int], ...]
+    energy_min: float
+    energy_max: float
+    images: tuple[SliceImageResult, ...]
+    filename: str
+    mime_type: str
 
 
 def print_options(file=sys.stderr) -> None:
     print(
-        "Create a 16-bit grayscale TIFF from one 2-D slice of an XSF energy map.\n"
+        "Create 16-bit integer or 32-bit float grayscale TIFF slices from an XSF map.\n"
         "\n"
         "Examples:\n"
-        "python3 xsf_slice_to_tiff.py diff/energy_grid_Y.xsf\n"
-        "python3 xsf_slice_to_tiff.py diff/energy_grid_Y.xsf --axis z --index 20 -o cut_z20.tiff\n"
-        "python3 xsf_slice_to_tiff.py diff/energy_grid_Y.xsf --axis z --geometry real\n"
-        "python3 xsf_slice_to_tiff.py diff/energy_grid_Y_minus_energy_grid_Nd.xsf --axis y --index 35 --invert\n",
+        "python3 xsf_slice_to_tiff.py map.xsf --index 45\n"
+        "python3 xsf_slice_to_tiff.py map.xsf --indices 0,20,45,89 --bit-depth 16\n"
+        "python3 xsf_slice_to_tiff.py map.xsf --count 10 --geometry real\n"
+        "python3 xsf_slice_to_tiff.py map.xsf --count 5 --scaling per-slice -o cuts.zip\n",
         file=file,
     )
 
@@ -62,20 +86,43 @@ class SliceArgumentParser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = SliceArgumentParser(
-        description="Write one 2-D cut through an XSF 3-D energy grid as a 16-bit TIFF."
+        description="Write one TIFF slice or a ZIP containing multiple TIFF slices from an XSF grid."
     )
     parser.add_argument("input_xsf", type=Path, help="input XSF energy map")
-    parser.add_argument("-o", "--output", type=Path, help="output TIFF path")
+    parser.add_argument("-o", "--output", type=Path, help="output TIFF or ZIP path")
     parser.add_argument(
         "--axis",
         choices=("x", "y", "z"),
         default="z",
         help="axis perpendicular to the cut plane (default: z)",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--index",
         type=int,
-        help="slice index along the selected axis (default: middle slice)",
+        help="one slice index (default: middle slice)",
+    )
+    selection.add_argument(
+        "--indices",
+        help="comma-separated exact slice indices, for example 0,20,45,89",
+    )
+    selection.add_argument(
+        "--count",
+        type=int,
+        help="number of equidistant slices spanning the complete selected axis",
+    )
+    parser.add_argument(
+        "--bit-depth",
+        type=int,
+        choices=(16, 32),
+        default=32,
+        help="TIFF pixel depth: uint16 or normalized float32 (default: 32)",
+    )
+    parser.add_argument(
+        "--scaling",
+        choices=("shared", "per-slice"),
+        default="shared",
+        help="use one contrast range for all slices or scale each separately (default: shared)",
     )
     parser.add_argument(
         "--invert",
@@ -86,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--geometry",
         choices=("grid", "real"),
         default="grid",
-        help="render in square grid-index space or projected real space (default: grid)",
+        help="render in grid-index space or projected real space (default: grid)",
     )
     parser.add_argument(
         "--pixels-per-angstrom",
@@ -107,11 +154,93 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def default_output_path(input_xsf: Path, axis: str, index: int, geometry: str) -> Path:
+def parse_slice_indices(value: str) -> list[int]:
+    """Parse and validate a comma-separated list of exact slice indices."""
+    if not value.strip():
+        raise ValueError("the exact index list is empty")
+
+    indices: list[int] = []
+    for position, token in enumerate(value.split(","), start=1):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"index entry {position} is empty")
+        try:
+            index = int(token)
+        except ValueError as error:
+            raise ValueError(f"invalid slice index {token!r}; use comma-separated integers") from error
+        indices.append(index)
+
+    if len(set(indices)) != len(indices):
+        raise ValueError("slice indices must not contain duplicates")
+    return indices
+
+
+def select_slice_indices(
+    axis_size: int,
+    *,
+    index: int | None = None,
+    indices: list[int] | tuple[int, ...] | None = None,
+    count: int | None = None,
+) -> list[int]:
+    """Resolve exact, equidistant, or default-middle slice selection."""
+    supplied = sum(value is not None for value in (index, indices, count))
+    if supplied > 1:
+        raise ValueError("choose only one of index, indices, or count")
+    if axis_size < 1:
+        raise ValueError("the selected grid axis contains no slices")
+
+    if indices is not None:
+        selected = [int(value) for value in indices]
+        if not selected:
+            raise ValueError("the exact index list is empty")
+        if len(set(selected)) != len(selected):
+            raise ValueError("slice indices must not contain duplicates")
+    elif count is not None:
+        if count < 1:
+            raise ValueError("slice count must be at least 1")
+        if count > axis_size:
+            raise ValueError(
+                f"slice count {count} exceeds the {axis_size} available positions"
+            )
+        if count == 1:
+            selected = [axis_size // 2]
+        else:
+            selected = np.rint(np.linspace(0, axis_size - 1, count)).astype(int).tolist()
+    elif index is not None:
+        selected = [index]
+    else:
+        selected = [axis_size // 2]
+
+    for selected_index in selected:
+        if selected_index < 0 or selected_index >= axis_size:
+            raise ValueError(
+                f"index {selected_index} is outside the selected axis; "
+                f"valid range is 0..{axis_size - 1}"
+            )
+    return selected
+
+
+def slice_filename(stem: str, axis: str, index: int, geometry: str) -> str:
     suffix = f"{axis}{index:03d}"
     if geometry == "real":
         suffix += "_real"
-    return input_xsf.with_name(f"{input_xsf.stem}_{suffix}.tiff")
+    return f"{stem}_{suffix}.tiff"
+
+
+def default_output_path(
+    input_xsf: Path,
+    axis: str,
+    index: int,
+    geometry: str,
+) -> Path:
+    return input_xsf.with_name(slice_filename(input_xsf.stem, axis, index, geometry))
+
+
+def default_archive_path(input_xsf: Path, axis: str, geometry: str) -> Path:
+    suffix = f"{axis}_slices"
+    if geometry == "real":
+        suffix += "_real"
+    return input_xsf.with_name(f"{input_xsf.stem}_{suffix}.zip")
 
 
 def extract_slice(data: np.ndarray, axis: str, index: int) -> np.ndarray:
@@ -123,8 +252,8 @@ def extract_slice(data: np.ndarray, axis: str, index: int) -> np.ndarray:
     else:
         slice_2d = data[:, :, index]
 
-    # Numpy arrays use row, column for images. Transpose so the first remaining
-    # grid axis goes left-to-right and the second remaining axis goes top-to-bottom.
+    # NumPy images use row, column. Transpose so the first remaining grid axis
+    # goes left-to-right and the second goes top-to-bottom.
     return np.asarray(slice_2d, dtype=float).T
 
 
@@ -138,22 +267,11 @@ def extract_slice_plane(data: np.ndarray, axis: str, index: int) -> np.ndarray:
     return np.asarray(data[:, :, index], dtype=float)
 
 
-def scale_to_uint16(slice_2d: np.ndarray, invert: bool) -> tuple[np.ndarray, float, float]:
-    energy_min = float(np.nanmin(slice_2d))
-    energy_max = float(np.nanmax(slice_2d))
-    if not np.isfinite(energy_min) or not np.isfinite(energy_max):
+def finite_limits(values: np.ndarray) -> tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
         raise ValueError("slice contains no finite energy values")
-
-    if energy_max > energy_min:
-        scaled = (slice_2d - energy_min) * (65535.0 / (energy_max - energy_min))
-    else:
-        scaled = np.zeros_like(slice_2d, dtype=float)
-
-    if invert:
-        scaled = 65535.0 - scaled
-
-    image_data = np.rint(np.clip(scaled, 0.0, 65535.0)).astype(np.uint16)
-    return image_data, energy_min, energy_max
+    return float(np.min(finite)), float(np.max(finite))
 
 
 def scale_with_limits(
@@ -161,19 +279,40 @@ def scale_with_limits(
     energy_min: float,
     energy_max: float,
     invert: bool,
+    bit_depth: int = 16,
 ) -> np.ndarray:
+    """Scale energies to uint16 or normalized float32 image samples."""
+    if bit_depth not in BIT_DEPTHS:
+        raise ValueError("bit depth must be 16 or 32")
+
     if energy_max > energy_min:
-        scaled = (values - energy_min) * (65535.0 / (energy_max - energy_min))
+        scaled = (values - energy_min) / (energy_max - energy_min)
     else:
         scaled = np.zeros_like(values, dtype=float)
 
     if invert:
-        scaled = 65535.0 - scaled
+        scaled = 1.0 - scaled
+    scaled = np.clip(scaled, 0.0, 1.0)
 
-    return np.rint(np.clip(scaled, 0.0, 65535.0)).astype(np.uint16)
+    if bit_depth == 16:
+        return np.rint(scaled * 65535.0).astype(np.uint16)
+    return scaled.astype(np.float32)
 
 
-def project_plane_vectors(vector_u: np.ndarray, vector_v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def scale_to_uint16(slice_2d: np.ndarray, invert: bool) -> tuple[np.ndarray, float, float]:
+    """Backward-compatible helper for scaling one slice to uint16."""
+    energy_min, energy_max = finite_limits(slice_2d)
+    return (
+        scale_with_limits(slice_2d, energy_min, energy_max, invert, bit_depth=16),
+        energy_min,
+        energy_max,
+    )
+
+
+def project_plane_vectors(
+    vector_u: np.ndarray,
+    vector_v: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """Project two 3-D in-plane vectors into a local 2-D Cartesian plane."""
     length_u = float(np.linalg.norm(vector_u))
     if length_u <= 0.0:
@@ -207,7 +346,11 @@ def default_pixels_per_angstrom(
     return max(candidates)
 
 
-def bilinear_sample(plane: np.ndarray, u_fraction: np.ndarray, v_fraction: np.ndarray) -> np.ndarray:
+def bilinear_sample(
+    plane: np.ndarray,
+    u_fraction: np.ndarray,
+    v_fraction: np.ndarray,
+) -> np.ndarray:
     """Sample plane[u, v] at fractional coordinates in [0, 1]."""
     size_u, size_v = plane.shape
     u_index = np.clip(u_fraction, 0.0, 1.0) * (size_u - 1)
@@ -222,7 +365,6 @@ def bilinear_sample(plane: np.ndarray, u_fraction: np.ndarray, v_fraction: np.nd
 
     du = u_index - u0
     dv = v_index - v0
-
     return (
         plane[u0, v0] * (1.0 - du) * (1.0 - dv)
         + plane[u1, v0] * du * (1.0 - dv)
@@ -231,32 +373,23 @@ def bilinear_sample(plane: np.ndarray, u_fraction: np.ndarray, v_fraction: np.nd
     )
 
 
-def render_real_space_slice(
+def real_space_samples(
     plane: np.ndarray,
     vector_u: np.ndarray,
     vector_v: np.ndarray,
     pixels_per_angstrom: float | None,
-    invert: bool,
-    background: str,
-) -> tuple[np.ndarray, float, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Interpolate one oblique plane onto a rectangular real-space canvas."""
     vector_u_2d, vector_v_2d = project_plane_vectors(vector_u, vector_v)
-
     if pixels_per_angstrom is None:
         pixels_per_angstrom = default_pixels_per_angstrom(
-            plane.shape,
-            vector_u_2d,
-            vector_v_2d,
+            plane.shape, vector_u_2d, vector_v_2d
         )
     if pixels_per_angstrom <= 0.0:
         raise ValueError("--pixels-per-angstrom must be greater than zero")
 
     corners = np.array(
-        [
-            [0.0, 0.0],
-            vector_u_2d,
-            vector_v_2d,
-            vector_u_2d + vector_v_2d,
-        ],
+        [[0.0, 0.0], vector_u_2d, vector_v_2d, vector_u_2d + vector_v_2d],
         dtype=float,
     )
     lower = corners.min(axis=0)
@@ -271,12 +404,9 @@ def render_real_space_slice(
     x, y = np.meshgrid(columns, rows)
 
     basis = np.column_stack([vector_u_2d, vector_v_2d])
-    inverse_basis = np.linalg.inv(basis)
-    coordinates = np.stack([x.ravel(), y.ravel()], axis=0)
-    fractions = inverse_basis @ coordinates
+    fractions = np.linalg.inv(basis) @ np.stack([x.ravel(), y.ravel()], axis=0)
     u_fraction = fractions[0].reshape((height, width))
     v_fraction = fractions[1].reshape((height, width))
-
     tolerance = 1e-9
     inside = (
         (u_fraction >= -tolerance)
@@ -284,63 +414,150 @@ def render_real_space_slice(
         & (v_fraction >= -tolerance)
         & (v_fraction <= 1.0 + tolerance)
     )
+    return bilinear_sample(plane, u_fraction, v_fraction), inside, pixels_per_angstrom
 
-    energy_min = float(np.nanmin(plane))
-    energy_max = float(np.nanmax(plane))
-    if not np.isfinite(energy_min) or not np.isfinite(energy_max):
-        raise ValueError("slice contains no finite energy values")
 
-    sampled = bilinear_sample(plane, u_fraction, v_fraction)
-    scaled = scale_with_limits(sampled, energy_min, energy_max, invert=invert)
-    background_value = np.uint16(0 if background == "black" else 65535)
-    image_data = np.full((height, width), background_value, dtype=np.uint16)
+def render_real_space_slice(
+    plane: np.ndarray,
+    vector_u: np.ndarray,
+    vector_v: np.ndarray,
+    pixels_per_angstrom: float | None,
+    invert: bool,
+    background: str,
+    bit_depth: int = 16,
+    energy_limits: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, float, float, float]:
+    """Render a real-space plane; defaults retain the former uint16 behavior."""
+    energy_min, energy_max = finite_limits(plane)
+    scale_min, scale_max = energy_limits or (energy_min, energy_max)
+    sampled, inside, final_resolution = real_space_samples(
+        plane, vector_u, vector_v, pixels_per_angstrom
+    )
+    scaled = scale_with_limits(sampled, scale_min, scale_max, invert, bit_depth)
+    if bit_depth == 16:
+        background_value: int | float = 0 if background == "black" else 65535
+        image_data = np.full(scaled.shape, background_value, dtype=np.uint16)
+    else:
+        background_value = 0.0 if background == "black" else 1.0
+        image_data = np.full(scaled.shape, background_value, dtype=np.float32)
     image_data[inside] = scaled[inside]
+    return image_data, energy_min, energy_max, final_resolution
 
-    return image_data, energy_min, energy_max, pixels_per_angstrom
 
-
-def write_slice_tiff(
-    input_xsf: Path,
-    output_path: Path | None,
+def _validate_render_options(
     axis: str,
-    index: int | None,
+    geometry: str,
+    background: str,
+    bit_depth: int,
+    scaling: str,
+) -> None:
+    if axis not in AXIS_TO_NUMBER:
+        raise ValueError(f"unknown axis {axis!r}; use 'x', 'y', or 'z'")
+    if geometry not in {"grid", "real"}:
+        raise ValueError(f"unknown geometry {geometry!r}; use 'grid' or 'real'")
+    if background not in {"black", "white"}:
+        raise ValueError(f"unknown background {background!r}; use 'black' or 'white'")
+    if bit_depth not in BIT_DEPTHS:
+        raise ValueError("bit depth must be 16 or 32")
+    if scaling not in SCALING_MODES:
+        raise ValueError("scaling must be 'shared' or 'per-slice'")
+
+
+def _render_parsed_slice(
+    grid,
+    *,
+    axis: str,
+    index: int,
     invert: bool,
     geometry: str,
     pixels_per_angstrom: float | None,
     background: str,
-    force: bool,
-) -> SliceResult:
-    text = input_xsf.read_text(encoding="utf-8")
-    image_result = render_slice_image(
-        text,
-        source_name=str(input_xsf),
+    bit_depth: int,
+    scaling: str,
+    scale_limits: tuple[float, float],
+) -> SliceImageResult:
+    plane = extract_slice_plane(grid.data, axis, index)
+    energy_min, energy_max = finite_limits(plane)
+    scale_min, scale_max = scale_limits
+
+    if geometry == "grid":
+        values = extract_slice(grid.data, axis, index)
+        image_data = scale_with_limits(
+            values, scale_min, scale_max, invert, bit_depth
+        )
+    else:
+        plane_axis_u, plane_axis_v = PLANE_AXES[axis]
+        image_data, _, _, _ = render_real_space_slice(
+            plane,
+            grid.vectors[plane_axis_u],
+            grid.vectors[plane_axis_v],
+            pixels_per_angstrom,
+            invert,
+            background,
+            bit_depth=bit_depth,
+            energy_limits=scale_limits,
+        )
+
+    return SliceImageResult(
         axis=axis,
         index=index,
-        invert=invert,
         geometry=geometry,
-        pixels_per_angstrom=pixels_per_angstrom,
-        background=background,
+        bit_depth=bit_depth,
+        scaling=scaling,
+        image_shape=(int(image_data.shape[1]), int(image_data.shape[0])),
+        energy_min=energy_min,
+        energy_max=energy_max,
+        scale_min=scale_min,
+        scale_max=scale_max,
+        image_data=image_data,
     )
-    final_output_path = output_path or default_output_path(
-        input_xsf,
-        image_result.axis,
-        image_result.index,
-        image_result.geometry,
+
+
+def render_slice_images(
+    input_text: str,
+    source_name: str = "uploaded.xsf",
+    axis: str = "z",
+    index: int | None = None,
+    indices: list[int] | tuple[int, ...] | None = None,
+    count: int | None = None,
+    invert: bool = False,
+    geometry: str = "grid",
+    pixels_per_angstrom: float | None = None,
+    background: str = "black",
+    bit_depth: int = 32,
+    scaling: str = "shared",
+) -> tuple[SliceImageResult, ...]:
+    """Render selected slices with shared or independent contrast limits."""
+    _validate_render_options(axis, geometry, background, bit_depth, scaling)
+    grid = parse_cut_grid_text(input_text, source_name=source_name)
+    selected = select_slice_indices(
+        grid.shape[AXIS_TO_NUMBER[axis]],
+        index=index,
+        indices=indices,
+        count=count,
     )
-    if final_output_path.exists() and not force:
-        raise ValueError(f"{final_output_path} already exists; use --force to overwrite it")
 
-    image = Image.fromarray(image_result.image_data, mode="I;16")
-    image.save(final_output_path)
-
-    return SliceResult(
-        axis=image_result.axis,
-        index=image_result.index,
-        geometry=image_result.geometry,
-        image_shape=image_result.image_shape,
-        energy_min=image_result.energy_min,
-        energy_max=image_result.energy_max,
-        output_path=final_output_path,
+    local_limits = [finite_limits(extract_slice_plane(grid.data, axis, i)) for i in selected]
+    shared_limits = (
+        min(limits[0] for limits in local_limits),
+        max(limits[1] for limits in local_limits),
+    )
+    return tuple(
+        _render_parsed_slice(
+            grid,
+            axis=axis,
+            index=selected_index,
+            invert=invert,
+            geometry=geometry,
+            pixels_per_angstrom=pixels_per_angstrom,
+            background=background,
+            bit_depth=bit_depth,
+            scaling=scaling,
+            scale_limits=(
+                shared_limits if scaling == "shared" else local_limits[position]
+            ),
+        )
+        for position, selected_index in enumerate(selected)
     )
 
 
@@ -353,49 +570,93 @@ def render_slice_image(
     geometry: str,
     pixels_per_angstrom: float | None,
     background: str,
+    bit_depth: int = 32,
 ) -> SliceImageResult:
-    if axis not in AXIS_TO_NUMBER:
-        raise ValueError(f"unknown axis {axis!r}; use 'x', 'y', or 'z'")
-    if geometry not in {"grid", "real"}:
-        raise ValueError(f"unknown geometry {geometry!r}; use 'grid' or 'real'")
-    if background not in {"black", "white"}:
-        raise ValueError(f"unknown background {background!r}; use 'black' or 'white'")
-
-    grid = parse_cut_grid_text(input_text, source_name=source_name)
-
-    axis_number = AXIS_TO_NUMBER[axis]
-    axis_size = grid.shape[axis_number]
-    if index is None:
-        index = axis_size // 2
-    if index < 0 or index >= axis_size:
-        raise ValueError(
-            f"index {index} is outside axis {axis!r}; valid range is 0..{axis_size - 1}"
-        )
-
-    if geometry == "grid":
-        slice_2d = extract_slice(grid.data, axis, index)
-        image_data, energy_min, energy_max = scale_to_uint16(slice_2d, invert=invert)
-    else:
-        plane = extract_slice_plane(grid.data, axis, index)
-        plane_axis_u, plane_axis_v = PLANE_AXES[axis]
-        image_data, energy_min, energy_max, pixels_per_angstrom = render_real_space_slice(
-            plane,
-            grid.vectors[plane_axis_u],
-            grid.vectors[plane_axis_v],
-            pixels_per_angstrom=pixels_per_angstrom,
-            invert=invert,
-            background=background,
-        )
-
-    return SliceImageResult(
+    """Backward-compatible single-slice renderer, now float32 by default."""
+    return render_slice_images(
+        input_text,
+        source_name=source_name,
         axis=axis,
         index=index,
+        invert=invert,
         geometry=geometry,
-        image_shape=(int(image_data.shape[1]), int(image_data.shape[0])),
-        energy_min=energy_min,
-        energy_max=energy_max,
-        image_data=image_data,
+        pixels_per_angstrom=pixels_per_angstrom,
+        background=background,
+        bit_depth=bit_depth,
+        scaling="shared",
+    )[0]
+
+
+def image_to_tiff_bytes(image_data: np.ndarray) -> bytes:
+    buffer = BytesIO()
+    Image.fromarray(image_data).save(buffer, format="TIFF")
+    return buffer.getvalue()
+
+
+def export_xsf_slices_to_bytes(
+    input_text: str,
+    source_name: str = "uploaded.xsf",
+    filename_stem: str = "energy_grid",
+    axis: str = "z",
+    index: int | None = None,
+    indices: list[int] | tuple[int, ...] | None = None,
+    count: int | None = None,
+    invert: bool = False,
+    geometry: str = "grid",
+    pixels_per_angstrom: float | None = None,
+    background: str = "black",
+    bit_depth: int = 32,
+    scaling: str = "shared",
+) -> tuple[bytes, SliceExportResult]:
+    """Return one TIFF or a ZIP of TIFFs plus export statistics."""
+    images = render_slice_images(
+        input_text,
+        source_name=source_name,
+        axis=axis,
+        index=index,
+        indices=indices,
+        count=count,
+        invert=invert,
+        geometry=geometry,
+        pixels_per_angstrom=pixels_per_angstrom,
+        background=background,
+        bit_depth=bit_depth,
+        scaling=scaling,
     )
+    stem = Path(filename_stem).stem or "energy_grid"
+    if len(images) == 1:
+        filename = slice_filename(stem, axis, images[0].index, geometry)
+        output_bytes = image_to_tiff_bytes(images[0].image_data)
+        mime_type = "image/tiff"
+    else:
+        archive_suffix = f"{axis}_slices"
+        if geometry == "real":
+            archive_suffix += "_real"
+        filename = f"{stem}_{archive_suffix}.zip"
+        buffer = BytesIO()
+        with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
+            for image in images:
+                archive.writestr(
+                    slice_filename(stem, axis, image.index, geometry),
+                    image_to_tiff_bytes(image.image_data),
+                )
+        output_bytes = buffer.getvalue()
+        mime_type = "application/zip"
+
+    result = SliceExportResult(
+        axis=axis,
+        indices=tuple(image.index for image in images),
+        geometry=geometry,
+        bit_depth=bit_depth,
+        scaling=scaling,
+        image_shapes=tuple(image.image_shape for image in images),
+        energy_min=min(image.energy_min for image in images),
+        energy_max=max(image.energy_max for image in images),
+        images=images,
+        filename=filename,
+        mime_type=mime_type,
+    )
+    return output_bytes, result
 
 
 def slice_xsf_text_to_tiff_bytes(
@@ -407,42 +668,150 @@ def slice_xsf_text_to_tiff_bytes(
     geometry: str = "grid",
     pixels_per_angstrom: float | None = None,
     background: str = "black",
+    bit_depth: int = 32,
 ) -> tuple[bytes, SliceImageResult]:
-    result = render_slice_image(
+    """Compatibility wrapper that always exports one TIFF."""
+    output_bytes, export = export_xsf_slices_to_bytes(
         input_text,
         source_name=source_name,
+        filename_stem=Path(source_name).stem,
         axis=axis,
         index=index,
         invert=invert,
         geometry=geometry,
         pixels_per_angstrom=pixels_per_angstrom,
         background=background,
+        bit_depth=bit_depth,
+        scaling="shared",
     )
-    buffer = BytesIO()
-    Image.fromarray(result.image_data, mode="I;16").save(buffer, format="TIFF")
-    return buffer.getvalue(), result
+    return output_bytes, export.images[0]
+
+
+def write_slice_tiff(
+    input_xsf: Path,
+    output_path: Path | None,
+    axis: str,
+    index: int | None,
+    invert: bool,
+    geometry: str,
+    pixels_per_angstrom: float | None,
+    background: str,
+    force: bool,
+    bit_depth: int = 32,
+) -> SliceResult:
+    """Compatibility wrapper for writing one selected TIFF."""
+    text = input_xsf.read_text(encoding="utf-8")
+    output_bytes, export = export_xsf_slices_to_bytes(
+        text,
+        source_name=str(input_xsf),
+        filename_stem=input_xsf.stem,
+        axis=axis,
+        index=index,
+        invert=invert,
+        geometry=geometry,
+        pixels_per_angstrom=pixels_per_angstrom,
+        background=background,
+        bit_depth=bit_depth,
+    )
+    image = export.images[0]
+    final_path = output_path or default_output_path(input_xsf, axis, image.index, geometry)
+    if final_path.exists() and not force:
+        raise ValueError(f"{final_path} already exists; use --force to overwrite it")
+    final_path.write_bytes(output_bytes)
+    return SliceResult(
+        axis=axis,
+        index=image.index,
+        geometry=geometry,
+        bit_depth=bit_depth,
+        scaling="shared",
+        image_shape=image.image_shape,
+        energy_min=image.energy_min,
+        energy_max=image.energy_max,
+        output_path=final_path,
+    )
+
+
+def write_slice_export(
+    input_xsf: Path,
+    *,
+    output_path: Path | None,
+    axis: str,
+    index: int | None,
+    indices: list[int] | None,
+    count: int | None,
+    invert: bool,
+    geometry: str,
+    pixels_per_angstrom: float | None,
+    background: str,
+    bit_depth: int,
+    scaling: str,
+    force: bool,
+) -> tuple[SliceExportResult, Path]:
+    text = input_xsf.read_text(encoding="utf-8")
+    output_bytes, export = export_xsf_slices_to_bytes(
+        text,
+        source_name=str(input_xsf),
+        filename_stem=input_xsf.stem,
+        axis=axis,
+        index=index,
+        indices=indices,
+        count=count,
+        invert=invert,
+        geometry=geometry,
+        pixels_per_angstrom=pixels_per_angstrom,
+        background=background,
+        bit_depth=bit_depth,
+        scaling=scaling,
+    )
+    if output_path is None:
+        if len(export.indices) == 1:
+            final_path = default_output_path(
+                input_xsf, axis, export.indices[0], geometry
+            )
+        else:
+            final_path = default_archive_path(input_xsf, axis, geometry)
+    else:
+        final_path = output_path
+    if final_path.exists() and not force:
+        raise ValueError(f"{final_path} already exists; use --force to overwrite it")
+    final_path.write_bytes(output_bytes)
+    return export, final_path
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        result = write_slice_tiff(
+        exact_indices = parse_slice_indices(args.indices) if args.indices is not None else None
+        export, output_path = write_slice_export(
             args.input_xsf,
             output_path=args.output,
             axis=args.axis,
             index=args.index,
+            indices=exact_indices,
+            count=args.count,
             invert=args.invert,
             geometry=args.geometry,
             pixels_per_angstrom=args.pixels_per_angstrom,
             background=args.background,
+            bit_depth=args.bit_depth,
+            scaling=args.scaling,
             force=args.force,
         )
-        print(f"Axis:       {result.axis}")
-        print(f"Index:      {result.index}")
-        print(f"Geometry:   {result.geometry}")
-        print(f"Image:      {result.image_shape[0]} x {result.image_shape[1]} pixels")
-        print(f"Energy:     {result.energy_min:.7f} to {result.energy_max:.7f} eV")
-        print(f"Written:    {result.output_path}")
+        shapes = set(export.image_shapes)
+        image_description = (
+            f"{export.image_shapes[0][0]} x {export.image_shapes[0][1]} pixels"
+            if len(shapes) == 1
+            else "varied image dimensions"
+        )
+        print(f"Axis:       {export.axis}")
+        print(f"Slices:     {len(export.indices)}")
+        print(f"Indices:    {', '.join(str(value) for value in export.indices)}")
+        print(f"Geometry:   {export.geometry}")
+        print(f"Bit depth:  {export.bit_depth}-bit")
+        print(f"Scaling:    {export.scaling}")
+        print(f"Image:      {image_description}")
+        print(f"Energy:     {export.energy_min:.7f} to {export.energy_max:.7f} eV")
+        print(f"Written:    {output_path}")
         return 0
     except (OSError, ValueError) as error:
         print_options()

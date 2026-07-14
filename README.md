@@ -2,11 +2,13 @@
 
 Streamlit app and command-line helpers for simple XSF 3-D data-grid workflows.
 
-The online Streamlit app focuses on exporting 16-bit TIFF slices from XSF
-energy maps:
+The Streamlit app includes TIFF slice export from XSF energy maps:
 
-- choose the slice axis and index
+- export one exact slice or multiple exact/equidistant slices
 - render in raw grid space or real-space lattice geometry
+- choose normalized 32-bit float TIFF (default) or 16-bit integer TIFF
+- use shared brightness scaling for comparison or scale every slice separately
+- download multiple slices together as a ZIP
 - optionally invert brightness
 
 - cut one XSF grid to Cartesian/fractional bounds or a 4-point oblique box
