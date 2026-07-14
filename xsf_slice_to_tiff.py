@@ -7,13 +7,15 @@ import argparse
 import sys
 from dataclasses import dataclass
 from io import BytesIO
+from itertools import product
 from pathlib import Path
+from typing import Mapping, Sequence
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 from PIL import Image
 
-from xsf_tools import parse_cut_grid_text
+from xsf_tools import parse_cut_grid_text, resolve_atomic_identifier
 
 
 AXIS_TO_NUMBER = {"x": 0, "y": 1, "z": 2}
@@ -51,6 +53,17 @@ class SliceImageResult:
 
 
 @dataclass(frozen=True)
+class AtomMapResult:
+    axis: str
+    index: int
+    geometry: str
+    bit_depth: int
+    image_shape: tuple[int, int]
+    intersecting_atoms: int
+    image_data: np.ndarray
+
+
+@dataclass(frozen=True)
 class SliceExportResult:
     axis: str
     indices: tuple[int, ...]
@@ -63,6 +76,11 @@ class SliceExportResult:
     images: tuple[SliceImageResult, ...]
     filename: str
     mime_type: str
+    include_atoms: bool
+    elements: tuple[str, ...]
+    atom_radii: tuple[tuple[str, float], ...]
+    atom_maps: tuple[AtomMapResult, ...]
+    mapped_atoms: int
 
 
 def print_options(file=sys.stderr) -> None:
@@ -73,7 +91,9 @@ def print_options(file=sys.stderr) -> None:
         "python3 xsf_slice_to_tiff.py map.xsf --index 45\n"
         "python3 xsf_slice_to_tiff.py map.xsf --indices 0,20,45,89 --bit-depth 16\n"
         "python3 xsf_slice_to_tiff.py map.xsf --count 10 --geometry real\n"
-        "python3 xsf_slice_to_tiff.py map.xsf --count 5 --scaling per-slice -o cuts.zip\n",
+        "python3 xsf_slice_to_tiff.py map.xsf --count 5 --scaling per-slice -o cuts.zip\n"
+        "python3 xsf_slice_to_tiff.py map.xsf --index 45 --include-atoms "
+        "--atom-radius Mg=1.2 --atom-radius Ni=0.9\n",
         file=file,
     )
 
@@ -147,11 +167,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="background outside the real-space cell (default: black)",
     )
     parser.add_argument(
+        "--include-atoms",
+        action="store_true",
+        help="include raw-valued atomic sphere TIFFs in a ZIP",
+    )
+    parser.add_argument(
+        "--atom-radius",
+        action="append",
+        default=[],
+        metavar="ELEMENT=ANGSTROM",
+        help="sphere radius for one element; repeat as needed (default: 1.0 A)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="overwrite the output file if it already exists",
     )
     return parser
+
+
+def parse_atom_radius_specs(specifications: Sequence[str]) -> dict[str, float]:
+    """Parse repeated ELEMENT=ANGSTROM command-line radius definitions."""
+    radii: dict[str, float] = {}
+    for specification in specifications:
+        if specification.count("=") != 1:
+            raise ValueError(
+                f"invalid atom radius {specification!r}; use ELEMENT=ANGSTROM"
+            )
+        identifier, radius_text = (part.strip() for part in specification.split("=", 1))
+        symbol, _ = resolve_atomic_identifier(identifier, "--atom-radius")
+        if symbol in radii:
+            raise ValueError(f"atom radius for {symbol} was specified more than once")
+        try:
+            radius = float(radius_text)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid radius {radius_text!r} for {symbol}; use a number in angstrom"
+            ) from error
+        if not np.isfinite(radius) or radius <= 0.0:
+            raise ValueError(f"atom radius for {symbol} must be greater than zero")
+        radii[symbol] = radius
+    return radii
 
 
 def parse_slice_indices(value: str) -> list[int]:
@@ -225,6 +281,11 @@ def slice_filename(stem: str, axis: str, index: int, geometry: str) -> str:
     if geometry == "real":
         suffix += "_real"
     return f"{stem}_{suffix}.tiff"
+
+
+def atom_slice_filename(stem: str, axis: str, index: int, geometry: str) -> str:
+    energy_name = slice_filename(stem, axis, index, geometry)
+    return energy_name.removesuffix(".tiff") + "_atoms.tiff"
 
 
 def default_output_path(
@@ -373,17 +434,17 @@ def bilinear_sample(
     )
 
 
-def real_space_samples(
-    plane: np.ndarray,
+def real_space_fraction_coordinates(
+    plane_shape: tuple[int, int],
     vector_u: np.ndarray,
     vector_v: np.ndarray,
     pixels_per_angstrom: float | None,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Interpolate one oblique plane onto a rectangular real-space canvas."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return fractional in-plane coordinates for a real-space canvas."""
     vector_u_2d, vector_v_2d = project_plane_vectors(vector_u, vector_v)
     if pixels_per_angstrom is None:
         pixels_per_angstrom = default_pixels_per_angstrom(
-            plane.shape, vector_u_2d, vector_v_2d
+            plane_shape, vector_u_2d, vector_v_2d
         )
     if pixels_per_angstrom <= 0.0:
         raise ValueError("--pixels-per-angstrom must be greater than zero")
@@ -414,7 +475,29 @@ def real_space_samples(
         & (v_fraction >= -tolerance)
         & (v_fraction <= 1.0 + tolerance)
     )
-    return bilinear_sample(plane, u_fraction, v_fraction), inside, pixels_per_angstrom
+    return u_fraction, v_fraction, inside, pixels_per_angstrom
+
+
+def real_space_samples(
+    plane: np.ndarray,
+    vector_u: np.ndarray,
+    vector_v: np.ndarray,
+    pixels_per_angstrom: float | None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Interpolate one oblique plane onto a rectangular real-space canvas."""
+    u_fraction, v_fraction, inside, final_resolution = (
+        real_space_fraction_coordinates(
+            plane.shape,
+            vector_u,
+            vector_v,
+            pixels_per_angstrom,
+        )
+    )
+    return (
+        bilinear_sample(plane, u_fraction, v_fraction),
+        inside,
+        final_resolution,
+    )
 
 
 def render_real_space_slice(
@@ -442,6 +525,182 @@ def render_real_space_slice(
         image_data = np.full(scaled.shape, background_value, dtype=np.float32)
     image_data[inside] = scaled[inside]
     return image_data, energy_min, energy_max, final_resolution
+
+
+def normalise_atom_radii(
+    atoms,
+    atom_radii: Mapping[str, float] | None,
+    default_radius: float = 1.0,
+) -> dict[str, float]:
+    """Validate per-element radii and fill missing detected elements."""
+    if not atoms:
+        raise ValueError("atom maps were requested, but the XSF has no PRIMCOORD atoms")
+    if not np.isfinite(default_radius) or default_radius <= 0.0:
+        raise ValueError("default atom radius must be greater than zero")
+
+    detected = {
+        atom.symbol: atom.atomic_number
+        for atom in atoms
+    }
+    supplied: dict[str, float] = {}
+    for identifier, raw_radius in (atom_radii or {}).items():
+        symbol, _ = resolve_atomic_identifier(str(identifier), "atom radii")
+        if symbol in supplied:
+            raise ValueError(f"atom radius for {symbol} was specified more than once")
+        if symbol not in detected:
+            raise ValueError(
+                f"atom radius was supplied for {symbol}, but that element is not in the XSF"
+            )
+        try:
+            radius = float(raw_radius)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"atom radius for {symbol} must be numeric") from error
+        if not np.isfinite(radius) or radius <= 0.0:
+            raise ValueError(f"atom radius for {symbol} must be greater than zero")
+        supplied[symbol] = radius
+
+    return {
+        symbol: supplied.get(symbol, float(default_radius))
+        for symbol, _ in sorted(detected.items(), key=lambda item: item[1])
+    }
+
+
+def atom_map_fractional_coordinates(
+    grid,
+    axis: str,
+    index: int,
+    geometry: str,
+    pixels_per_angstrom: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return DATAGRID fractional coordinates and valid pixels for one image."""
+    plane = extract_slice_plane(grid.data, axis, index)
+    plane_axis_u, plane_axis_v = PLANE_AXES[axis]
+    if geometry == "grid":
+        u_values = np.linspace(0.0, 1.0, plane.shape[0])
+        v_values = np.linspace(0.0, 1.0, plane.shape[1])
+        u_fraction, v_fraction = np.meshgrid(u_values, v_values)
+        inside = np.ones(u_fraction.shape, dtype=bool)
+    else:
+        u_fraction, v_fraction, inside, _ = real_space_fraction_coordinates(
+            plane.shape,
+            grid.vectors[plane_axis_u],
+            grid.vectors[plane_axis_v],
+            pixels_per_angstrom,
+        )
+
+    fractional = np.zeros(u_fraction.shape + (3,), dtype=float)
+    axis_size = grid.shape[AXIS_TO_NUMBER[axis]]
+    cut_fraction = index / (axis_size - 1) if axis_size > 1 else 0.0
+    fractional[..., AXIS_TO_NUMBER[axis]] = cut_fraction
+    fractional[..., plane_axis_u] = u_fraction
+    fractional[..., plane_axis_v] = v_fraction
+    return fractional, inside
+
+
+def cell_plane_heights(vectors: np.ndarray) -> tuple[float, float, float]:
+    """Return periodic cell heights perpendicular to each fractional axis."""
+    volume = abs(float(np.linalg.det(vectors)))
+    if volume <= 1e-12:
+        raise ValueError("cannot render atom spheres: DATAGRID vectors are singular")
+    heights = []
+    for axis in range(3):
+        other = [candidate for candidate in range(3) if candidate != axis]
+        area = float(np.linalg.norm(np.cross(vectors[other[0]], vectors[other[1]])))
+        if area <= 1e-12:
+            raise ValueError("cannot render atom spheres: DATAGRID vectors are singular")
+        heights.append(volume / area)
+    return heights[0], heights[1], heights[2]
+
+
+def render_atom_sphere_map(
+    grid,
+    *,
+    axis: str,
+    index: int,
+    geometry: str,
+    pixels_per_angstrom: float | None,
+    bit_depth: int,
+    atom_radii: Mapping[str, float],
+) -> AtomMapResult:
+    """Render periodic 3-D atomic spheres on one selected image plane."""
+    fractional, inside = atom_map_fractional_coordinates(
+        grid,
+        axis,
+        index,
+        geometry,
+        pixels_per_angstrom,
+    )
+    cartesian = grid.origin + np.einsum("...i,ij->...j", fractional, grid.vectors)
+    if bit_depth == 16:
+        image_data = np.zeros(inside.shape, dtype=np.uint16)
+    else:
+        image_data = np.zeros(inside.shape, dtype=np.float32)
+
+    plane_axis_u, plane_axis_v = PLANE_AXES[axis]
+    plane_normal = np.cross(
+        grid.vectors[plane_axis_u],
+        grid.vectors[plane_axis_v],
+    )
+    plane_normal /= np.linalg.norm(plane_normal)
+    axis_size = grid.shape[AXIS_TO_NUMBER[axis]]
+    cut_fraction = index / (axis_size - 1) if axis_size > 1 else 0.0
+    plane_origin = grid.origin + cut_fraction * grid.vectors[AXIS_TO_NUMBER[axis]]
+
+    heights = cell_plane_heights(grid.vectors)
+    minimum_height = min(heights)
+    canvas_min = np.min(cartesian[inside], axis=0)
+    canvas_max = np.max(cartesian[inside], axis=0)
+    intersecting_atoms = 0
+    translation_cache: dict[int, np.ndarray] = {}
+
+    for atom in grid.atoms:
+        radius = atom_radii[atom.symbol]
+        repeats = max(1, int(np.ceil(radius / minimum_height)))
+        if repeats not in translation_cache:
+            coefficients = np.asarray(
+                list(product(range(-repeats, repeats + 1), repeat=3)),
+                dtype=float,
+            )
+            translation_cache[repeats] = coefficients @ grid.vectors
+        translations = translation_cache[repeats]
+
+        atom_fractional = np.linalg.solve(
+            grid.vectors.T,
+            atom.position - grid.origin,
+        )
+        atom_fractional = atom_fractional - np.floor(atom_fractional)
+        wrapped_center = grid.origin + atom_fractional @ grid.vectors
+        centers = wrapped_center + translations
+
+        plane_distances = np.abs((centers - plane_origin) @ plane_normal)
+        centers = centers[plane_distances <= radius + 1e-10]
+        if centers.size == 0:
+            continue
+
+        atom_mask = np.zeros(inside.shape, dtype=bool)
+        radius_squared = radius * radius + 1e-12
+        for center in centers:
+            if np.any(center < canvas_min - radius) or np.any(center > canvas_max + radius):
+                continue
+            delta = cartesian - center
+            atom_mask |= np.einsum("...i,...i->...", delta, delta) <= radius_squared
+        atom_mask &= inside
+        if not np.any(atom_mask):
+            continue
+
+        intersecting_atoms += 1
+        marker_value = 1000 + atom.atomic_number
+        image_data[atom_mask] = np.maximum(image_data[atom_mask], marker_value)
+
+    return AtomMapResult(
+        axis=axis,
+        index=index,
+        geometry=geometry,
+        bit_depth=bit_depth,
+        image_shape=(int(image_data.shape[1]), int(image_data.shape[0])),
+        intersecting_atoms=intersecting_atoms,
+        image_data=image_data,
+    )
 
 
 def _validate_render_options(
@@ -607,6 +866,8 @@ def export_xsf_slices_to_bytes(
     background: str = "black",
     bit_depth: int = 32,
     scaling: str = "shared",
+    include_atoms: bool = False,
+    atom_radii: Mapping[str, float] | None = None,
 ) -> tuple[bytes, SliceExportResult]:
     """Return one TIFF or a ZIP of TIFFs plus export statistics."""
     images = render_slice_images(
@@ -624,22 +885,56 @@ def export_xsf_slices_to_bytes(
         scaling=scaling,
     )
     stem = Path(filename_stem).stem or "energy_grid"
-    if len(images) == 1:
+    normalised_radii: dict[str, float] = {}
+    atom_maps: tuple[AtomMapResult, ...] = ()
+    if include_atoms:
+        grid = parse_cut_grid_text(input_text, source_name=source_name)
+        normalised_radii = normalise_atom_radii(grid.atoms, atom_radii)
+        atom_maps = tuple(
+            render_atom_sphere_map(
+                grid,
+                axis=axis,
+                index=image.index,
+                geometry=geometry,
+                pixels_per_angstrom=pixels_per_angstrom,
+                bit_depth=bit_depth,
+                atom_radii=normalised_radii,
+            )
+            for image in images
+        )
+        for image, atom_map in zip(images, atom_maps):
+            if image.image_shape != atom_map.image_shape:
+                raise ValueError(
+                    f"atom map dimensions do not match energy slice {image.index}"
+                )
+
+    if len(images) == 1 and not include_atoms:
         filename = slice_filename(stem, axis, images[0].index, geometry)
         output_bytes = image_to_tiff_bytes(images[0].image_data)
         mime_type = "image/tiff"
     else:
-        archive_suffix = f"{axis}_slices"
-        if geometry == "real":
-            archive_suffix += "_real"
+        if len(images) == 1:
+            archive_suffix = f"{axis}{images[0].index:03d}"
+            if geometry == "real":
+                archive_suffix += "_real"
+            archive_suffix += "_with_atoms"
+        else:
+            archive_suffix = f"{axis}_slices"
+            if geometry == "real":
+                archive_suffix += "_real"
         filename = f"{stem}_{archive_suffix}.zip"
         buffer = BytesIO()
         with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
-            for image in images:
+            for position, image in enumerate(images):
                 archive.writestr(
                     slice_filename(stem, axis, image.index, geometry),
                     image_to_tiff_bytes(image.image_data),
                 )
+                if include_atoms:
+                    archive.writestr(
+                        atom_slice_filename(stem, axis, image.index, geometry),
+                        image_to_tiff_bytes(atom_maps[position].image_data),
+                    )
         output_bytes = buffer.getvalue()
         mime_type = "application/zip"
 
@@ -655,6 +950,11 @@ def export_xsf_slices_to_bytes(
         images=images,
         filename=filename,
         mime_type=mime_type,
+        include_atoms=include_atoms,
+        elements=tuple(normalised_radii),
+        atom_radii=tuple(normalised_radii.items()),
+        atom_maps=atom_maps,
+        mapped_atoms=sum(atom_map.intersecting_atoms for atom_map in atom_maps),
     )
     return output_bytes, result
 
@@ -746,6 +1046,8 @@ def write_slice_export(
     bit_depth: int,
     scaling: str,
     force: bool,
+    include_atoms: bool = False,
+    atom_radii: Mapping[str, float] | None = None,
 ) -> tuple[SliceExportResult, Path]:
     text = input_xsf.read_text(encoding="utf-8")
     output_bytes, export = export_xsf_slices_to_bytes(
@@ -762,14 +1064,11 @@ def write_slice_export(
         background=background,
         bit_depth=bit_depth,
         scaling=scaling,
+        include_atoms=include_atoms,
+        atom_radii=atom_radii,
     )
     if output_path is None:
-        if len(export.indices) == 1:
-            final_path = default_output_path(
-                input_xsf, axis, export.indices[0], geometry
-            )
-        else:
-            final_path = default_archive_path(input_xsf, axis, geometry)
+        final_path = input_xsf.with_name(export.filename)
     else:
         final_path = output_path
     if final_path.exists() and not force:
@@ -782,6 +1081,9 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         exact_indices = parse_slice_indices(args.indices) if args.indices is not None else None
+        atom_radii = parse_atom_radius_specs(args.atom_radius)
+        if atom_radii and not args.include_atoms:
+            raise ValueError("--atom-radius requires --include-atoms")
         export, output_path = write_slice_export(
             args.input_xsf,
             output_path=args.output,
@@ -796,6 +1098,8 @@ def main() -> int:
             bit_depth=args.bit_depth,
             scaling=args.scaling,
             force=args.force,
+            include_atoms=args.include_atoms,
+            atom_radii=atom_radii,
         )
         shapes = set(export.image_shapes)
         image_description = (
@@ -811,6 +1115,17 @@ def main() -> int:
         print(f"Scaling:    {export.scaling}")
         print(f"Image:      {image_description}")
         print(f"Energy:     {export.energy_min:.7f} to {export.energy_max:.7f} eV")
+        if export.include_atoms:
+            radii_text = ", ".join(
+                f"{symbol}={radius:g} A" for symbol, radius in export.atom_radii
+            )
+            atom_counts = ", ".join(
+                f"{atom_map.index}:{atom_map.intersecting_atoms}"
+                for atom_map in export.atom_maps
+            )
+            print(f"Atom maps:  yes ({radii_text})")
+            print(f"Mapped:     {export.mapped_atoms} atom-slice intersections")
+            print(f"Atom count: {atom_counts}")
         print(f"Written:    {output_path}")
         return 0
     except (OSError, ValueError) as error:

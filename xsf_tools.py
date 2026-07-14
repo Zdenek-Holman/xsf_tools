@@ -13,6 +13,27 @@ import numpy as np
 Bounds = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
 Point3D = tuple[float, float, float]
 
+ELEMENT_SYMBOLS = (
+    "",
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+    "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+    "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd",
+    "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
+    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm",
+    "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds",
+    "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
+)
+ATOMIC_NUMBER_BY_SYMBOL = {
+    symbol: atomic_number
+    for atomic_number, symbol in enumerate(ELEMENT_SYMBOLS)
+    if symbol
+}
+
 
 @dataclass(frozen=True)
 class CutStats:
@@ -36,6 +57,13 @@ class SubtractStats:
     result_max: float
 
 
+@dataclass(frozen=True)
+class XSFAtom:
+    symbol: str
+    atomic_number: int
+    position: np.ndarray
+
+
 @dataclass
 class XSFCutGrid:
     source_name: str
@@ -46,6 +74,7 @@ class XSFCutGrid:
     data: np.ndarray
     data_start: int
     data_end: int
+    atoms: tuple[XSFAtom, ...]
 
 
 @dataclass
@@ -89,6 +118,82 @@ def _normalise_point(point: Sequence[float], name: str) -> np.ndarray:
     if result.shape != (3,):
         raise ValueError(f"{name} must be a 3-D point")
     return result
+
+
+def resolve_atomic_identifier(identifier: str, source_name: str = "XSF") -> tuple[str, int]:
+    """Return canonical element symbol and atomic number from an XSF identifier."""
+    token = identifier.strip()
+    if not token:
+        raise ValueError(f"{source_name}: empty atomic identifier")
+
+    try:
+        atomic_number = int(token)
+    except ValueError:
+        symbol = token[0].upper() + token[1:].lower()
+        atomic_number = ATOMIC_NUMBER_BY_SYMBOL.get(symbol, 0)
+        if atomic_number == 0:
+            raise ValueError(f"{source_name}: unknown element {identifier!r}")
+        return symbol, atomic_number
+
+    if atomic_number < 1 or atomic_number >= len(ELEMENT_SYMBOLS):
+        raise ValueError(
+            f"{source_name}: atomic number {atomic_number} is outside 1..118"
+        )
+    return ELEMENT_SYMBOLS[atomic_number], atomic_number
+
+
+def parse_primcoord_atoms(lines: Sequence[str], source_name: str) -> tuple[XSFAtom, ...]:
+    """Parse the first PRIMCOORD atom list, if present."""
+    primcoord = next(
+        (i for i, line in enumerate(lines) if line.strip().upper() == "PRIMCOORD"),
+        None,
+    )
+    if primcoord is None:
+        return ()
+    if primcoord + 1 >= len(lines):
+        raise ValueError(f"{source_name}: PRIMCOORD atom count is missing")
+
+    count_fields = lines[primcoord + 1].split()
+    if not count_fields:
+        raise ValueError(f"{source_name}: PRIMCOORD atom count is missing")
+    try:
+        atom_count = int(count_fields[0])
+    except ValueError as error:
+        raise ValueError(f"{source_name}: invalid PRIMCOORD atom count") from error
+    if atom_count < 0:
+        raise ValueError(f"{source_name}: PRIMCOORD atom count must not be negative")
+    if primcoord + 2 + atom_count > len(lines):
+        raise ValueError(f"{source_name}: incomplete PRIMCOORD atom list")
+
+    atoms: list[XSFAtom] = []
+    for atom_offset, line in enumerate(
+        lines[primcoord + 2 : primcoord + 2 + atom_count],
+        start=1,
+    ):
+        fields = line.split()
+        if len(fields) < 4:
+            raise ValueError(
+                f"{source_name}: invalid PRIMCOORD atom {atom_offset}: {line.strip()!r}"
+            )
+        symbol, atomic_number = resolve_atomic_identifier(fields[0], source_name)
+        try:
+            position = np.asarray(fields[1:4], dtype=float)
+        except ValueError as error:
+            raise ValueError(
+                f"{source_name}: nonnumeric coordinates for PRIMCOORD atom {atom_offset}"
+            ) from error
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError(
+                f"{source_name}: invalid coordinates for PRIMCOORD atom {atom_offset}"
+            )
+        atoms.append(
+            XSFAtom(
+                symbol=symbol,
+                atomic_number=atomic_number,
+                position=position,
+            )
+        )
+    return tuple(atoms)
 
 
 def _grid_coordinate_arrays(
@@ -192,6 +297,7 @@ def parse_cut_grid_text(input_text: str, source_name: str = "uploaded.xsf") -> X
         )
 
     data = values.reshape((nx, ny, nz), order="F")
+    atoms = parse_primcoord_atoms(lines, source_name)
     return XSFCutGrid(
         source_name=source_name,
         lines=lines,
@@ -201,6 +307,7 @@ def parse_cut_grid_text(input_text: str, source_name: str = "uploaded.xsf") -> X
         data=data,
         data_start=data_start,
         data_end=end,
+        atoms=atoms,
     )
 
 

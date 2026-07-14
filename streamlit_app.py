@@ -273,6 +273,9 @@ elif tool == "Slice TIFF":
             `0.0` to `1.0`. **16-bit** stores integer brightness values from `0`
             to `65535`. The TIFFs are visualizations; the displayed energy range
             remains available separately in eV.
+
+            **Atom-position TIFFs** contain periodic 3-D sphere cross-sections.
+            Their raw values are `1000 + atomic number`, with zero outside atoms.
             """
         )
 
@@ -308,6 +311,7 @@ elif tool == "Slice TIFF":
 
     slice_text = None
     axis_size = None
+    uploaded_grid = None
     file_error = None
     if slice_file is not None:
         try:
@@ -394,7 +398,44 @@ elif tool == "Slice TIFF":
             except ValueError as error:
                 selection_error = str(error)
 
-    invert_slice = st.checkbox("Invert brightness", key="slice_invert")
+    option_columns = st.columns(2)
+    with option_columns[0]:
+        invert_slice = st.checkbox("Invert brightness", key="slice_invert")
+    with option_columns[1]:
+        include_atom_maps = st.checkbox(
+            "Include atom-position TIFFs",
+            key="slice_include_atom_maps",
+        )
+
+    atom_radii = {}
+    atom_error = None
+    if include_atom_maps:
+        if uploaded_grid is None:
+            if slice_file is None:
+                st.info("Upload a valid XSF file to configure atom radii.")
+        elif not uploaded_grid.atoms:
+            atom_error = "Atom maps were requested, but the XSF has no PRIMCOORD atoms."
+        else:
+            detected_elements = sorted(
+                {
+                    atom.symbol: atom.atomic_number
+                    for atom in uploaded_grid.atoms
+                }.items(),
+                key=lambda item: item[1],
+            )
+            st.caption("Atomic sphere radii in Å")
+            for row_start in range(0, len(detected_elements), 4):
+                row = detected_elements[row_start : row_start + 4]
+                radius_columns = st.columns(len(row))
+                for column, (symbol, _) in zip(radius_columns, row):
+                    with column:
+                        atom_radii[symbol] = st.number_input(
+                            f"{symbol} radius (Å)",
+                            min_value=0.000001,
+                            value=1.0,
+                            format="%.6f",
+                            key=f"slice_atom_radius_{symbol}",
+                        )
 
     if file_error is not None:
         st.warning(file_error)
@@ -405,6 +446,8 @@ elif tool == "Slice TIFF":
         )
     elif selection_error is not None:
         st.warning(selection_error)
+    if atom_error is not None:
+        st.warning(atom_error)
 
     if st.button("Generate TIFF", type="primary", key="generate_slice"):
         if slice_file is None:
@@ -413,6 +456,8 @@ elif tool == "Slice TIFF":
             st.error(file_error)
         elif selection_error is not None:
             st.error(selection_error)
+        elif atom_error is not None:
+            st.error(atom_error)
         elif selected_preview is None:
             st.error("Choose at least one valid slice index.")
         else:
@@ -438,6 +483,8 @@ elif tool == "Slice TIFF":
                     background="black",
                     bit_depth=int(slice_bit_depth),
                     scaling=slice_scaling,
+                    include_atoms=include_atom_maps,
+                    atom_radii=atom_radii,
                 )
             except ValueError as error:
                 st.error(str(error))
@@ -463,8 +510,24 @@ elif tool == "Slice TIFF":
             st.metric("Image size", "Varies")
         st.caption(f"Generated indices: {', '.join(str(value) for value in stats.indices)}")
         st.metric("Energy range", f"{stats.energy_min:.7f} to {stats.energy_max:.7f} eV")
+        if stats.include_atoms:
+            st.metric("Mapped atom intersections", stats.mapped_atoms)
+            st.caption(
+                "Atom radii: "
+                + ", ".join(
+                    f"{symbol} = {radius:g} Å"
+                    for symbol, radius in stats.atom_radii
+                )
+            )
+            st.caption(
+                "Intersecting atoms by slice: "
+                + ", ".join(
+                    f"{atom_map.index}: {atom_map.intersecting_atoms}"
+                    for atom_map in stats.atom_maps
+                )
+            )
         st.download_button(
-            "Download TIFF" if len(stats.indices) == 1 else "Download TIFF ZIP",
+            "Download TIFF" if stats.mime_type == "image/tiff" else "Download TIFF ZIP",
             data=st.session_state.slice_output_bytes,
             file_name=st.session_state.slice_result_filename,
             mime=st.session_state.slice_result_mime,

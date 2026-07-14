@@ -10,6 +10,8 @@ The Streamlit app includes TIFF slice export from XSF energy maps:
 - use shared brightness scaling for comparison or scale every slice separately
 - download multiple slices together as a ZIP
 - optionally invert brightness
+- optionally add raw-valued atom-position TIFFs using periodic 3-D sphere cuts
+- set a separate sphere radius in Å for every detected element
 
 - cut one XSF grid to Cartesian/fractional bounds or a 4-point oblique box
 - subtract values from two uploaded XSF maps, with optional minima alignment
